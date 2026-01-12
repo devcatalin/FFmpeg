@@ -1,0 +1,358 @@
+Video/Audio Analysis with FFmpeg Filters
+=========================================
+
+This document explains how to use FFmpeg's built-in filters for analyzing
+video and audio content without additional dependencies. These filters are
+useful for detecting scene changes, silence gaps, audio peaks, black frames,
+and other characteristics in long-form content (1+ hours).
+
+All examples output parseable text to stderr. For JSON output, the
+approach is to capture stderr and parse it, as FFmpeg's analysis filters
+primarily use log output rather than structured data formats.
+
+
+Scene Detection
+===============
+
+FFmpeg provides two main approaches for scene detection: the `scdet` filter
+and the `select` filter with scene expressions.
+
+Using scdet Filter
+------------------
+
+The `scdet` filter detects scene changes and outputs timestamps when the
+scene score exceeds a threshold. It sets frame metadata and logs messages
+when scene changes are detected.
+
+Command (output is written to stderr):
+
+    ffmpeg -i input.mp4 -vf "scdet=threshold=10" -f null - 2>&1
+
+Output format:
+
+    [Parsed_scdet_0 @ 0x...] lavfi.scd.score=95.432 lavfi.scd.time=12.5
+    [Parsed_scdet_0 @ 0x...] lavfi.scd.score=87.123 lavfi.scd.time=45.2
+
+Parameters:
+  - threshold (t): Scene change threshold as percentage (0-100).
+    Default is 10. Values 8-14 are typically good starting points.
+    Lower values detect more scenes (including minor changes).
+  - sc_pass (s): When set to 1, passes only scene change frames.
+
+To extract only timestamps with grep:
+
+    ffmpeg -i input.mp4 -vf "scdet=threshold=10" -f null - 2>&1 | \
+        grep "lavfi.scd.time" | sed 's/.*lavfi.scd.time=//'
+
+Using select Filter with Scene Expression
+-----------------------------------------
+
+The `select` filter with the `scene` variable can filter frames based on
+scene change scores. This is useful for creating thumbnails.
+
+Command to output scene change information:
+
+    ffmpeg -i input.mp4 -vf "select='gt(scene,0.4)',showinfo" -fps_mode vfr \
+        -f null - 2>&1
+
+The scene value ranges from 0 to 1:
+  - 0.3-0.5 is typically a good range for significant scene changes
+  - Values below 0.3 may catch minor changes
+  - Values above 0.5 may miss some transitions
+
+Performance:
+  - Runs at approximately 100-200x realtime on modern hardware
+  - 1-hour video: approximately 20-40 seconds
+
+Gotchas:
+  - The `scene` variable in select is computed per-frame and may have
+    false positives during gradual fades
+  - For better reliability with many scenes, prefer `scdet`
+  - Both methods require decoding all frames
+
+
+Silence Detection
+=================
+
+The `silencedetect` filter identifies periods of silence in audio streams.
+This is useful for finding natural clip boundaries, removing dead air, or
+identifying pause points.
+
+Basic Command:
+
+    ffmpeg -i input.mp4 -af "silencedetect=noise=-50dB:d=0.5" -f null -
+
+Output format:
+
+    [silencedetect @ 0x...] silence_start: 5.234
+    [silencedetect @ 0x...] silence_end: 7.891 | silence_duration: 2.657
+    [silencedetect @ 0x...] silence_start: 123.456
+    [silencedetect @ 0x...] silence_end: 125.789 | silence_duration: 2.333
+
+Parameters:
+  - noise (n): Noise tolerance level. Can be specified in dB (-50dB) or
+    as amplitude ratio (0.001). Default is -60dB.
+  - duration (d): Minimum silence duration in seconds. Default is 2.
+    Use shorter values (0.5) for finding brief pauses.
+  - mono (m): Process each channel separately when set to 1.
+
+Parsing timestamps to CSV:
+
+    ffmpeg -i input.mp4 -af "silencedetect=noise=-50dB:d=0.5" -f null - 2>&1 | \
+        grep "silence_" | \
+        awk '/silence_start/{start=$NF} /silence_end/{print start","$5","$NF}'
+
+Output as CSV (start, end, duration):
+
+    5.234,7.891,2.657
+    123.456,125.789,2.333
+
+For more aggressive detection (shorter gaps):
+
+    ffmpeg -i input.mp4 -af "silencedetect=noise=-30dB:d=0.3" -f null -
+
+Performance:
+  - Runs at approximately 200-500x realtime (audio-only processing)
+  - 1-hour video: approximately 10-20 seconds
+
+Gotchas:
+  - Noise floor varies by recording; test with different -50dB to -30dB
+  - Background music may prevent silence detection
+  - Use lower duration (d=0.3) for finding brief natural pauses
+  - Mono mode produces more output but helps identify stereo issues
+
+
+Audio Loudness Detection
+========================
+
+volumedetect Filter
+-------------------
+
+The `volumedetect` filter analyzes overall audio levels. It provides
+mean volume, max volume, and a histogram of volume distribution. The
+statistics are printed at the end of processing.
+
+Command (output is written to stderr at end of processing):
+
+    ffmpeg -i input.mp4 -af "volumedetect" -f null - 2>&1
+
+Output format:
+
+    [Parsed_volumedetect_0 @ 0x...] n_samples: 1234567
+    [Parsed_volumedetect_0 @ 0x...] mean_volume: -27.3 dB
+    [Parsed_volumedetect_0 @ 0x...] max_volume: -4.2 dB
+    [Parsed_volumedetect_0 @ 0x...] histogram_4db: 6
+    [Parsed_volumedetect_0 @ 0x...] histogram_5db: 62
+    [Parsed_volumedetect_0 @ 0x...] histogram_6db: 286
+
+The histogram shows how many samples exist at each dB level below 0dB.
+
+Parsing key values:
+
+    ffmpeg -i input.mp4 -af "volumedetect" -f null - 2>&1 | \
+        grep -E "(mean_volume|max_volume)"
+
+Performance:
+  - Runs at approximately 300-500x realtime
+  - 1-hour video: approximately 10-15 seconds
+
+astats Filter for Detailed Analysis
+-----------------------------------
+
+For per-frame loudness or finding specific loud moments, use `astats`
+with metadata output:
+
+    ffmpeg -i input.mp4 -af "astats=metadata=1:reset=1,ametadata=print" \
+        -f null -
+
+This prints per-frame statistics including peak levels. Use reset=1 to
+get per-frame measurements instead of cumulative.
+
+For finding peaks above a threshold, combine with ametadata filter:
+
+    ffmpeg -i input.mp4 \
+        -af "astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.Peak_level:value=-10:function=greater" \
+        -f null -
+
+ebur128 Filter for Broadcast Loudness
+-------------------------------------
+
+For broadcast-standard loudness measurement (EBU R128), use:
+
+    ffmpeg -i input.mp4 -af "ebur128=peak=true" -f null -
+
+Output includes:
+  - Integrated loudness (LUFS)
+  - Loudness range (LU)
+  - True peak (dBTP)
+  - Momentary and short-term loudness
+
+Gotchas:
+  - volumedetect only outputs at the end of processing; no per-frame data
+  - For finding loud MOMENTS (applause, music drops), use astats or ebur128
+  - All volumes are relative to 0dBFS (digital full scale)
+
+
+Black Frame Detection
+=====================
+
+The `blackdetect` filter identifies intervals of black video, useful for
+detecting chapter transitions, commercials, or invalid recordings.
+
+Basic Command:
+
+    ffmpeg -i input.mp4 -vf "blackdetect=d=0.5:pix_th=0.10" -f null -
+
+Output format:
+
+    [blackdetect @ 0x...] black_start:12.34 black_end:15.67 black_duration:3.33
+    [blackdetect @ 0x...] black_start:45.00 black_end:47.50 black_duration:2.50
+
+Parameters:
+  - black_min_duration (d): Minimum black segment duration in seconds.
+    Default is 2.0. Use 0.5 for detecting brief transitions.
+  - picture_black_ratio_th (pic_th): Ratio of black pixels to total
+    pixels for a frame to be considered black. Default is 0.98.
+  - pixel_black_th (pix_th): Threshold for a pixel to be considered
+    black (0-1). Default is 0.10. Use 0.00 for pure black only.
+  - alpha: When true, checks alpha channel for transparency instead.
+
+Parsing to CSV (start, end, duration):
+
+    ffmpeg -i input.mp4 -vf "blackdetect=d=0.5:pix_th=0.10" -f null - 2>&1 | \
+        grep "black_start" | \
+        sed 's/.*black_start:\([^ ]*\) black_end:\([^ ]*\) black_duration:\([^ ]*\)/\1,\2,\3/'
+
+Example output:
+
+    12.34,15.67,3.33
+    45.00,47.50,2.50
+
+For strict black detection (no near-black frames):
+
+    ffmpeg -i input.mp4 -vf "blackdetect=d=2:pix_th=0.00" -f null -
+
+Performance:
+  - Runs at approximately 50-150x realtime (requires frame decoding)
+  - 1-hour video: approximately 30-90 seconds
+
+Gotchas:
+  - Very dark scenes may trigger false positives; adjust pix_th
+  - Letterboxed content counts black bars as black pixels
+  - For 4K content, processing is slower proportional to resolution
+
+
+Single-Pass Multi-Analysis
+==========================
+
+For efficiency, FFmpeg can run multiple analysis filters in a single
+pass. This decodes video/audio only once, significantly reducing
+processing time for long videos.
+
+Combined Video Analysis
+-----------------------
+
+Run scene detection and black detection together:
+
+    ffmpeg -i input.mp4 \
+        -vf "scdet=threshold=10,blackdetect=d=0.5:pix_th=0.10" \
+        -f null - 2>&1 | tee analysis.log
+
+Combined Audio Analysis
+-----------------------
+
+Run silence detection and volume analysis together:
+
+    ffmpeg -i input.mp4 \
+        -af "silencedetect=noise=-50dB:d=0.5,volumedetect" \
+        -f null - 2>&1 | tee audio_analysis.log
+
+Full Analysis in One Pass
+-------------------------
+
+Analyze both video and audio simultaneously:
+
+    ffmpeg -i input.mp4 \
+        -vf "scdet=threshold=10,blackdetect=d=0.5" \
+        -af "silencedetect=noise=-50dB:d=0.5,volumedetect" \
+        -f null - 2>&1 | tee full_analysis.log
+
+Splitting output by filter:
+
+    # Scene changes
+    grep "scd.time" full_analysis.log
+
+    # Black frames
+    grep "black_start" full_analysis.log
+
+    # Silence periods
+    grep "silence_" full_analysis.log
+
+    # Volume stats
+    grep -E "(mean_volume|max_volume)" full_analysis.log
+
+Performance (1-hour 1080p video, approximate):
+  - Single analysis filter: 30-60 seconds
+  - Combined filters (same stream): 35-70 seconds (minimal overhead)
+  - Both video and audio: 40-80 seconds
+
+The combined approach is approximately 2-3x faster than running each
+analysis separately.
+
+
+Metadata-Based Approach
+=======================
+
+For programmatic access to filter output, use the metadata filter to
+redirect analysis results to a file:
+
+    ffmpeg -i input.mp4 \
+        -vf "scdet=threshold=10,metadata=mode=print:file=scene_data.txt" \
+        -f null -
+
+This writes per-frame metadata to scene_data.txt:
+
+    frame:0    pts:0       pts_time:0
+    lavfi.scd.mafd=0.123456
+    lavfi.scd.score=0.005
+    frame:1    pts:1001    pts_time:0.033367
+    lavfi.scd.mafd=0.234567
+    lavfi.scd.score=0.012
+
+Use ametadata for audio filters:
+
+    ffmpeg -i input.mp4 \
+        -af "silencedetect=n=-50dB:d=0.5,ametadata=mode=print:file=silence_data.txt" \
+        -f null -
+
+
+Summary of Filters and Use Cases
+================================
+
++----------------+--------------------+------------------+----------------+
+| Filter         | Detects            | Typical Use      | Speed (1hr)    |
++----------------+--------------------+------------------+----------------+
+| scdet          | Scene changes      | Chapter markers  | 20-40 sec      |
+| select+scene   | Scene changes      | Thumbnails       | 20-40 sec      |
+| silencedetect  | Audio gaps         | Natural cuts     | 10-20 sec      |
+| volumedetect   | Overall volume     | Normalization    | 10-15 sec      |
+| astats         | Per-frame audio    | Peak detection   | 15-25 sec      |
+| ebur128        | Broadcast loudness | Compliance       | 15-25 sec      |
+| blackdetect    | Black frames       | Ad/chapter detect| 30-90 sec      |
++----------------+--------------------+------------------+----------------+
+
+Combined filters add minimal overhead (5-15%) compared to running each
+filter individually.
+
+
+Tips and Best Practices
+=======================
+
+1. Always test thresholds on a sample of your content first
+2. Use -t to analyze just the first few minutes during development:
+   ffmpeg -i input.mp4 -t 300 -vf "scdet" -f null -
+3. Redirect stderr to a file for later parsing: 2>&1 | tee analysis.log
+4. For 4K content, consider downscaling first for faster analysis:
+   ffmpeg -i input.mp4 -vf "scale=640:-1,scdet" -f null -
+5. Use -threads to control CPU usage if needed
+6. The -f null - output is required to discard processed data
